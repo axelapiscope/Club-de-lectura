@@ -358,14 +358,49 @@ END ACJJ_TRG_VALIDAR_MODERADOR;
 
 -- ============================================================
 -- TRG-10: Expulsion automatica por mas del 30% de inasistencias en un bimestre
--- Tabla: ACJJ_INASISTENCIAS (AFTER INSERT)
--- Correcciones:
---   - id_club_g -> id_club en ACJJ_INASISTENCIAS y ACJJ_GRUPOS_LECTORES
---   - id_club_g -> id_club en el WHERE de ACJJ_CALENDARIOS_MES
+-- Tablas: ACJJ_INASISTENCIAS, ACJJ_MEMBRESIAS, ACJJ_GRUPOS_LECTORES
+-- Correcciones aplicadas v3:
+--   - ORA-04091 resuelto: separado en paquete + trigger ROW + trigger STMT
+--   - El trigger de fila ya NO lee ACJJ_INASISTENCIAS (evita tabla mutando)
+--   - El trigger de statement lee la tabla cuando ya esta estable
+--   - Logica de negocio identica al TRG-10 original de Carmelo
 -- ============================================================
-CREATE OR REPLACE TRIGGER ACJJ_TRG_AUTO_EXPULSION
+
+-- Paquete auxiliar: actua como memoria temporal entre ambos triggers
+CREATE OR REPLACE PACKAGE ACJJ_PKG_EXPULSION AS
+    TYPE t_key IS RECORD (
+        id_lector    NUMBER,
+        id_club      NUMBER,
+        id_grupo     NUMBER,
+        id_membresia NUMBER,
+        cal_fecha    DATE,
+        fecha_ini_gl DATE
+    );
+    TYPE t_keys IS TABLE OF t_key INDEX BY PLS_INTEGER;
+    g_pending t_keys;
+    g_count   PLS_INTEGER := 0;
+END ACJJ_PKG_EXPULSION;
+/
+
+-- Trigger de FILA: captura los datos del INSERT, no lee la tabla
+CREATE OR REPLACE TRIGGER ACJJ_TRG_AUTO_EXPULSION_ROW
 AFTER INSERT ON ACJJ_INASISTENCIAS
 FOR EACH ROW
+BEGIN
+    ACJJ_PKG_EXPULSION.g_count := ACJJ_PKG_EXPULSION.g_count + 1;
+    ACJJ_PKG_EXPULSION.g_pending(ACJJ_PKG_EXPULSION.g_count).id_lector    := :NEW.id_lector;
+    ACJJ_PKG_EXPULSION.g_pending(ACJJ_PKG_EXPULSION.g_count).id_club      := :NEW.id_club;
+    ACJJ_PKG_EXPULSION.g_pending(ACJJ_PKG_EXPULSION.g_count).id_grupo     := :NEW.id_grupo;
+    ACJJ_PKG_EXPULSION.g_pending(ACJJ_PKG_EXPULSION.g_count).id_membresia := :NEW.id_membresia;
+    ACJJ_PKG_EXPULSION.g_pending(ACJJ_PKG_EXPULSION.g_count).cal_fecha    := :NEW.cal_fecha;
+    ACJJ_PKG_EXPULSION.g_pending(ACJJ_PKG_EXPULSION.g_count).fecha_ini_gl := :NEW.fecha_ini_gl;
+END ACJJ_TRG_AUTO_EXPULSION_ROW;
+/
+
+-- Trigger de STATEMENT: aqui si puede leer ACJJ_INASISTENCIAS con seguridad
+-- Contiene la logica identica al TRG-10 original de Carmelo
+CREATE OR REPLACE TRIGGER ACJJ_TRG_AUTO_EXPULSION_STMT
+AFTER INSERT ON ACJJ_INASISTENCIAS
 DECLARE
     v_mes_num       NUMBER;
     v_mes_inicio    NUMBER;
@@ -374,57 +409,66 @@ DECLARE
     v_total_reu     NUMBER;
     v_total_inas    NUMBER;
     v_porcentaje    NUMBER;
+    r               ACJJ_PKG_EXPULSION.t_key;
 BEGIN
-    v_mes_num    := TO_NUMBER(TO_CHAR(:NEW.cal_fecha, 'MM'));
-    v_mes_inicio := CASE WHEN MOD(v_mes_num, 2) = 0
-                         THEN v_mes_num - 1
-                         ELSE v_mes_num END;
+    FOR i IN 1 .. ACJJ_PKG_EXPULSION.g_count LOOP
+        r := ACJJ_PKG_EXPULSION.g_pending(i);
 
-    v_fecha_ini_bim := TO_DATE(
-        '01/' || LPAD(TO_CHAR(v_mes_inicio), 2, '0') || '/' ||
-        TO_CHAR(:NEW.cal_fecha, 'YYYY'), 'DD/MM/YYYY');
-    v_fecha_fin_bim := ADD_MONTHS(v_fecha_ini_bim, 2) - 1;
+        v_mes_num    := TO_NUMBER(TO_CHAR(r.cal_fecha, 'MM'));
+        v_mes_inicio := CASE WHEN MOD(v_mes_num, 2) = 0
+                             THEN v_mes_num - 1
+                             ELSE v_mes_num END;
 
-    SELECT COUNT(*) INTO v_total_reu
-    FROM   ACJJ_CALENDARIOS_MES
-    WHERE  id_grupo  = :NEW.id_grupo
-    AND    id_club   = :NEW.id_club
-    AND    realizado = 'S'
-    AND    fecha     BETWEEN v_fecha_ini_bim AND v_fecha_fin_bim;
+        v_fecha_ini_bim := TO_DATE(
+            '01/' || LPAD(TO_CHAR(v_mes_inicio), 2, '0') || '/' ||
+            TO_CHAR(r.cal_fecha, 'YYYY'), 'DD/MM/YYYY');
+        v_fecha_fin_bim := ADD_MONTHS(v_fecha_ini_bim, 2) - 1;
 
-    SELECT COUNT(*) INTO v_total_inas
-    FROM   ACJJ_INASISTENCIAS
-    WHERE  id_lector = :NEW.id_lector
-    AND    id_grupo  = :NEW.id_grupo
-    AND    id_club   = :NEW.id_club
-    AND    cal_fecha BETWEEN v_fecha_ini_bim AND v_fecha_fin_bim;
+        SELECT COUNT(*) INTO v_total_reu
+        FROM   ACJJ_CALENDARIOS_MES
+        WHERE  id_grupo  = r.id_grupo
+        AND    id_club   = r.id_club
+        AND    realizado = 'S'
+        AND    fecha     BETWEEN v_fecha_ini_bim AND v_fecha_fin_bim;
 
-    IF v_total_reu > 0 THEN
-        v_porcentaje := (v_total_inas / v_total_reu) * 100;
+        SELECT COUNT(*) INTO v_total_inas
+        FROM   ACJJ_INASISTENCIAS
+        WHERE  id_lector = r.id_lector
+        AND    id_grupo  = r.id_grupo
+        AND    id_club   = r.id_club
+        AND    cal_fecha BETWEEN v_fecha_ini_bim AND v_fecha_fin_bim;
 
-        IF v_porcentaje > 30 THEN
-            UPDATE ACJJ_MEMBRESIAS
-            SET    estatus       = 'I',
-                   fecha_retiro  = SYSDATE,
-                   motivo_retiro = 'Expulsado automaticamente: ' ||
-                       ROUND(v_porcentaje, 1) || '% inasistencias en bimestre ' ||
-                       TO_CHAR(v_fecha_ini_bim, 'MM/YYYY') || '-' ||
-                       TO_CHAR(v_fecha_fin_bim, 'MM/YYYY')
-            WHERE  id_lector    = :NEW.id_lector
-            AND    id_club      = :NEW.id_club
-            AND    id_membresia = :NEW.id_membresia
-            AND    estatus      = 'A';
+        IF v_total_reu > 0 THEN
+            v_porcentaje := (v_total_inas / v_total_reu) * 100;
 
-            UPDATE ACJJ_GRUPOS_LECTORES
-            SET    fecha_fin = SYSDATE
-            WHERE  id_lector    = :NEW.id_lector
-            AND    id_grupo     = :NEW.id_grupo
-            AND    id_club      = :NEW.id_club
-            AND    id_membresia = :NEW.id_membresia
-            AND    fecha_fin IS NULL;
+            IF v_porcentaje > 30 THEN
+                UPDATE ACJJ_MEMBRESIAS
+                SET    estatus       = 'I',
+                       fecha_retiro  = SYSDATE,
+                       motivo_retiro = 'Expulsado automaticamente: ' ||
+                           ROUND(v_porcentaje, 1) || '% inasistencias en bimestre ' ||
+                           TO_CHAR(v_fecha_ini_bim, 'MM/YYYY') || '-' ||
+                           TO_CHAR(v_fecha_fin_bim, 'MM/YYYY')
+                WHERE  id_lector    = r.id_lector
+                AND    id_club      = r.id_club
+                AND    id_membresia = r.id_membresia
+                AND    estatus      = 'A';
+
+                UPDATE ACJJ_GRUPOS_LECTORES
+                SET    fecha_fin = SYSDATE
+                WHERE  id_lector    = r.id_lector
+                AND    id_grupo     = r.id_grupo
+                AND    id_club      = r.id_club
+                AND    id_membresia = r.id_membresia
+                AND    fecha_fin    IS NULL;
+            END IF;
         END IF;
-    END IF;
-END ACJJ_TRG_AUTO_EXPULSION;
+    END LOOP;
+
+    -- Limpiar buffer para la proxima transaccion
+    ACJJ_PKG_EXPULSION.g_count := 0;
+    ACJJ_PKG_EXPULSION.g_pending.DELETE;
+END ACJJ_TRG_AUTO_EXPULSION_STMT;
 /
 
 COMMIT;
